@@ -36,6 +36,9 @@ pub(super) enum ServerCommand {
 	/// - Print database memory usage statistics
 	MemoryUsage,
 
+	/// - Print cache effectiveness statistics
+	CacheStats,
+
 	/// - Clears all of Tuwunel's caches
 	ClearCaches,
 

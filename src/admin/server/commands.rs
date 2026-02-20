@@ -78,6 +78,20 @@ pub(super) async fn memory_usage(&self) -> Result {
 }
 
 #[admin_command]
+pub(super) async fn cache_stats(&self) -> Result {
+	let services_stats = self.services.cache_stats().await?;
+
+	if services_stats.trim().is_empty() {
+		return self
+			.write_str("No cache statistics available.\n")
+			.await;
+	}
+
+	self.write_str(&format!("Services:\n{services_stats}"))
+		.await
+}
+
+#[admin_command]
 pub(super) async fn clear_caches(&self) -> Result {
 	self.services.clear_cache().await;
 

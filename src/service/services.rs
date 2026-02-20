@@ -263,3 +263,14 @@ pub async fn memory_usage(&self) -> Result<String> {
 		})
 		.await
 }
+
+#[implement(Services)]
+pub async fn cache_stats(&self) -> Result<String> {
+	self.services()
+		.try_stream()
+		.try_fold(String::new(), async |mut out, service| {
+			service.cache_stats(&mut out).await?;
+			Ok(out)
+		})
+		.await
+}
