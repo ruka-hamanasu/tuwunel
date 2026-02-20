@@ -1,5 +1,6 @@
 use std::{
 	collections::BTreeMap,
+	future::Future,
 	net::IpAddr,
 	sync::atomic::{AtomicBool, Ordering},
 	time::{Duration, Instant},
@@ -87,67 +88,119 @@ pub(crate) async fn send_transaction_message_route(
 		)));
 	}
 
-	let txn_start_time = Instant::now();
-	trace!(
-		pdus = body.pdus.len(),
-		edus = body.edus.len(),
-		elapsed = ?txn_start_time.elapsed(),
-		"Starting txn",
-	);
+	with_federation_txn_dedupe(
+		|| {
+			services
+				.transaction_ids
+				.existing_federation_txnid(body.origin(), &body.transaction_id)
+		},
+		|| {
+			services
+				.transaction_ids
+				.lock_federation_txnid(body.origin(), &body.transaction_id)
+		},
+		|response| {
+			services
+				.transaction_ids
+				.add_federation_txnid(body.origin(), &body.transaction_id, response)
+		},
+		|| async {
+			let txn_start_time = Instant::now();
+			trace!(
+				pdus = body.pdus.len(),
+				edus = body.edus.len(),
+				elapsed = ?txn_start_time.elapsed(),
+				"Starting txn",
+			);
 
-	let pdus = body
-		.pdus
-		.iter()
-		.stream()
-		.broad_then(|pdu| services.event_handler.parse_incoming_pdu(pdu))
-		.inspect_err(|e| debug_warn!("Could not parse PDU: {e}"))
-		.ready_filter_map(Result::ok);
+			let pdus = body
+				.pdus
+				.iter()
+				.stream()
+				.broad_then(|pdu| services.event_handler.parse_incoming_pdu(pdu))
+				.inspect_err(|e| debug_warn!("Could not parse PDU: {e}"))
+				.ready_filter_map(Result::ok);
 
-	let edus = body
-		.edus
-		.iter()
-		.map(|edu| edu.json().get())
-		.map(serde_json::from_str)
-		.filter_map(Result::ok)
-		.stream();
+			let edus = body
+				.edus
+				.iter()
+				.map(|edu| edu.json().get())
+				.map(serde_json::from_str)
+				.filter_map(Result::ok)
+				.stream();
 
-	trace!(
-		elapsed = ?txn_start_time.elapsed(),
-		"Parsed txn",
-	);
+			trace!(
+				elapsed = ?txn_start_time.elapsed(),
+				"Parsed txn",
+			);
 
-	let results = handle(
-		&services,
-		&client,
-		body.origin(),
-		&body.transaction_id,
-		txn_start_time,
-		pdus,
-		edus,
+			let results = handle(
+				&services,
+				&client,
+				body.origin(),
+				&body.transaction_id,
+				txn_start_time,
+				pdus,
+				edus,
+			)
+			.await?;
+
+			debug!(
+				pdus = body.pdus.len(),
+				edus = body.edus.len(),
+				elapsed = ?txn_start_time.elapsed(),
+				"Finished txn",
+			);
+
+			for (id, result) in &results {
+				if let Err(e) = result
+					&& matches!(e, Error::BadRequest(ErrorKind::NotFound, _))
+				{
+					warn!("Incoming PDU failed {id}: {e:?}");
+				}
+			}
+
+			Ok(send_transaction_message::v1::Response {
+				pdus: results
+					.into_iter()
+					.map(|(e, r)| (e, r.map_err(error::sanitized_message)))
+					.collect(),
+			})
+		},
 	)
-	.await?;
+	.await
+}
 
-	debug!(
-		pdus = body.pdus.len(),
-		edus = body.edus.len(),
-		elapsed = ?txn_start_time.elapsed(),
-		"Finished txn",
-	);
-
-	for (id, result) in &results {
-		if let Err(e) = result
-			&& matches!(e, Error::BadRequest(ErrorKind::NotFound, _))
-		{
-			warn!("Incoming PDU failed {id}: {e:?}");
-		}
+async fn with_federation_txn_dedupe<GetCached, GetCachedFut, LockTxn, LockTxnFut, AddCached, AddCachedFut, ProcessTxn, ProcessTxnFut, LockGuard>(
+	get_cached: GetCached,
+	lock_txn: LockTxn,
+	add_cached: AddCached,
+	process_txn: ProcessTxn,
+) -> Result<send_transaction_message::v1::Response>
+where
+	GetCached: Fn() -> GetCachedFut,
+	GetCachedFut: Future<Output = Option<send_transaction_message::v1::Response>>,
+	LockTxn: FnOnce() -> LockTxnFut,
+	LockTxnFut: Future<Output = LockGuard>,
+	AddCached: Fn(send_transaction_message::v1::Response) -> AddCachedFut,
+	AddCachedFut: Future<Output = ()>,
+	ProcessTxn: FnOnce() -> ProcessTxnFut,
+	ProcessTxnFut: Future<Output = Result<send_transaction_message::v1::Response>>,
+{
+	if let Some(response) = get_cached().await {
+		return Ok(response);
 	}
 
-	Ok(send_transaction_message::v1::Response {
-		pdus: results
-			.into_iter()
-			.map(|(e, r)| (e, r.map_err(error::sanitized_message)))
-			.collect(),
-	})
+	let _txn_lock = lock_txn().await;
+
+	if let Some(response) = get_cached().await {
+		return Ok(response);
+	}
+
+	let response = process_txn().await?;
+	add_cached(response.clone()).await;
+
+	Ok(response)
 }
 
 async fn handle(
@@ -324,27 +377,34 @@ async fn handle_edu(
 	edu: Edu,
 ) {
 	match edu {
-		| Edu::Presence(presence) if services.server.config.allow_incoming_presence =>
-			handle_edu_presence(services, client, origin, presence).await,
+		| Edu::Presence(presence) if services.server.config.allow_incoming_presence => {
+			handle_edu_presence(services, client, origin, presence).await
+		},
 
 		| Edu::Receipt(receipt)
 			if services
 				.server
 				.config
 				.allow_incoming_read_receipts =>
-			handle_edu_receipt(services, client, origin, receipt).await,
+		{
+			handle_edu_receipt(services, client, origin, receipt).await
+		},
 
-		| Edu::Typing(typing) if services.server.config.allow_incoming_typing =>
-			handle_edu_typing(services, client, origin, typing).await,
+		| Edu::Typing(typing) if services.server.config.allow_incoming_typing => {
+			handle_edu_typing(services, client, origin, typing).await
+		},
 
-		| Edu::DeviceListUpdate(content) =>
-			handle_edu_device_list_update(services, client, origin, content).await,
+		| Edu::DeviceListUpdate(content) => {
+			handle_edu_device_list_update(services, client, origin, content).await
+		},
 
-		| Edu::DirectToDevice(content) =>
-			handle_edu_direct_to_device(services, client, origin, content).await,
+		| Edu::DirectToDevice(content) => {
+			handle_edu_direct_to_device(services, client, origin, content).await
+		},
 
-		| Edu::SigningKeyUpdate(content) =>
-			handle_edu_signing_key_update(services, client, origin, content).await,
+		| Edu::SigningKeyUpdate(content) => {
+			handle_edu_signing_key_update(services, client, origin, content).await
+		},
 
 		| Edu::_Custom(ref _custom) => debug_warn!(?i, ?edu, "received custom/unknown EDU"),
 
@@ -479,10 +539,14 @@ async fn handle_edu_receipt_room_user(
 			let content = [(event_id.clone(), BTreeMap::from(receipts))];
 			services
 				.read_receipt
-				.readreceipt_update(user_id, room_id, &ReceiptEvent {
-					content: ReceiptEventContent(content.into()),
-					room_id: room_id.to_owned(),
-				})
+				.readreceipt_update(
+					user_id,
+					room_id,
+					&ReceiptEvent {
+						content: ReceiptEventContent(content.into()),
+						room_id: room_id.to_owned(),
+					},
+				)
 				.await;
 		})
 		.await;
@@ -677,6 +741,142 @@ async fn handle_edu_direct_to_device_event(
 				})
 				.await;
 		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	};
+
+	use tokio::sync::Mutex;
+	use tuwunel_core::err;
+
+	use super::*;
+
+	fn response() -> send_transaction_message::v1::Response {
+		send_transaction_message::v1::Response {
+			pdus: Default::default(),
+		}
+	}
+
+	#[tokio::test]
+	async fn dedupe_returns_cached_response_before_lock() {
+		let lock_calls = Arc::new(AtomicUsize::new(0));
+		let process_calls = Arc::new(AtomicUsize::new(0));
+
+		let result = with_federation_txn_dedupe(
+			|| async { Some(response()) },
+			|| {
+				let lock_calls = Arc::clone(&lock_calls);
+				async move {
+					lock_calls.fetch_add(1, Ordering::Relaxed);
+				}
+			},
+			|_| async {},
+			|| {
+				let process_calls = Arc::clone(&process_calls);
+				async move {
+					process_calls.fetch_add(1, Ordering::Relaxed);
+					Ok(response())
+				}
+			},
+		)
+		.await
+		.expect("cached response should succeed");
+
+		assert!(result.pdus.is_empty());
+		assert_eq!(lock_calls.load(Ordering::Relaxed), 0);
+		assert_eq!(process_calls.load(Ordering::Relaxed), 0);
+	}
+
+	#[tokio::test]
+	async fn dedupe_returns_cached_response_after_lock() {
+		let get_calls = Arc::new(AtomicUsize::new(0));
+		let process_calls = Arc::new(AtomicUsize::new(0));
+
+		let result = with_federation_txn_dedupe(
+			|| {
+				let get_calls = Arc::clone(&get_calls);
+				async move {
+					match get_calls.fetch_add(1, Ordering::Relaxed) {
+						| 0 => None,
+						| _ => Some(response()),
+					}
+				}
+			},
+			|| async {},
+			|_| async {},
+			|| {
+				let process_calls = Arc::clone(&process_calls);
+				async move {
+					process_calls.fetch_add(1, Ordering::Relaxed);
+					Ok(response())
+				}
+			},
+		)
+		.await
+		.expect("cached response should succeed");
+
+		assert!(result.pdus.is_empty());
+		assert_eq!(process_calls.load(Ordering::Relaxed), 0);
+		assert_eq!(get_calls.load(Ordering::Relaxed), 2);
+	}
+
+	#[tokio::test]
+	async fn dedupe_processes_and_caches_on_full_miss() {
+		let add_calls = Arc::new(AtomicUsize::new(0));
+		let added = Arc::new(Mutex::new(None));
+
+		let result = with_federation_txn_dedupe(
+			|| async { None },
+			|| async {},
+			{
+				let add_calls = Arc::clone(&add_calls);
+				let added = Arc::clone(&added);
+				move |response| {
+					let add_calls = Arc::clone(&add_calls);
+					let added = Arc::clone(&added);
+					async move {
+						add_calls.fetch_add(1, Ordering::Relaxed);
+						*added.lock().await = Some(response);
+					}
+				}
+			},
+			|| async { Ok(response()) },
+		)
+		.await
+		.expect("processed response should succeed");
+
+		assert!(result.pdus.is_empty());
+		assert_eq!(add_calls.load(Ordering::Relaxed), 1);
+		assert!(added.lock().await.as_ref().is_some());
+	}
+
+	#[tokio::test]
+	async fn dedupe_does_not_cache_failed_processing() {
+		let add_calls = Arc::new(AtomicUsize::new(0));
+
+		let result = with_federation_txn_dedupe(
+			|| async { None },
+			|| async {},
+			{
+				let add_calls = Arc::clone(&add_calls);
+				move |_| {
+					let add_calls = Arc::clone(&add_calls);
+					async move {
+						add_calls.fetch_add(1, Ordering::Relaxed);
+					}
+				}
+			},
+			|| async { Err(err!("process failed")) },
+		)
+		.await;
+
+		assert!(result.is_err());
+		assert_eq!(add_calls.load(Ordering::Relaxed), 0);
 	}
 }
 

@@ -257,6 +257,16 @@ pub struct Config {
 	#[serde(default = "default_roomid_spacehierarchy_cache_capacity")]
 	pub roomid_spacehierarchy_cache_capacity: u32,
 
+	/// Maximum entries in the in-memory cache used to deduplicate inbound
+	/// federation `PUT /_matrix/federation/v1/send/{txnId}` retries.
+	///
+	/// This cache is volatile and cleared on restart. Values are scaled by
+	/// `cache_capacity_modifier`.
+	///
+	/// default: varies by system
+	#[serde(default = "default_federation_inbound_txnid_cache_capacity")]
+	pub federation_inbound_txnid_cache_capacity: u32,
+
 	/// Minimum timeout a client can request for long-polling sync. Requests
 	/// will be clamped up to this value if smaller.
 	///
@@ -3139,6 +3149,23 @@ fn default_servernameevent_data_cache_capacity() -> u32 {
 fn default_stateinfo_cache_capacity() -> u32 { parallelism_scaled_u32(100) }
 
 fn default_roomid_spacehierarchy_cache_capacity() -> u32 { parallelism_scaled_u32(1000) }
+
+fn default_federation_inbound_txnid_cache_capacity() -> u32 {
+	parallelism_scaled_u32(2_000)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{default_federation_inbound_txnid_cache_capacity, parallelism_scaled_u32};
+
+	#[test]
+	fn default_federation_inbound_txnid_cache_capacity_is_parallelism_scaled() {
+		assert_eq!(
+			default_federation_inbound_txnid_cache_capacity(),
+			parallelism_scaled_u32(2_000),
+		);
+	}
+}
 
 fn default_dns_cache_entries() -> u32 { 32768 }
 
