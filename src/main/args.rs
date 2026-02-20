@@ -170,22 +170,52 @@ pub struct Args {
 impl Args {
 	#[must_use]
 	pub fn default_test(name: &[&str]) -> Self {
+		use std::{fs::create_dir, io::ErrorKind};
+
+		use tuwunel_core::utils::random_string;
+
 		let mut args = Self::default();
+		let test_name = if name.is_empty() {
+			"test".to_owned()
+		} else {
+			name.join("-")
+		};
+
+		let database_path = (0..32)
+			.find_map(|_| {
+				let path = std::env::temp_dir()
+					.join(format!("tuwunel-{test_name}-{}", random_string(16),));
+
+				match create_dir(&path) {
+					| Ok(()) => Some(path),
+					| Err(e) if e.kind() == ErrorKind::AlreadyExists => None,
+					| Err(e) => panic!("failed to create test database directory {path:?}: {e}"),
+				}
+			})
+			.expect("failed to allocate unique test database directory");
+		let database_path = database_path.to_string_lossy();
+
 		args.test
 			.extend(name.iter().copied().map(ToOwned::to_owned));
 		args.option
 			.push("server_name=\"localhost\"".into());
+		args.option
+			.push(format!("database_path={database_path:?}"));
 		args
 	}
 }
 
 impl Default for Args {
-	fn default() -> Self { Self::parse() }
+	fn default() -> Self {
+		Self::parse()
+	}
 }
 
 /// Parse commandline arguments into structured data
 #[must_use]
-pub fn parse() -> Args { Args::parse() }
+pub fn parse() -> Args {
+	Args::parse()
+}
 
 /// Synthesize any command line options with configuration file options.
 pub fn update(mut config: Figment, args: &Args) -> Result<Figment> {
